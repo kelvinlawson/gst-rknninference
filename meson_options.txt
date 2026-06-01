@@ -1,0 +1,2 @@
+option('rga', type : 'feature', value : 'auto',
+  description : 'RGA hardware preprocessing (DMA-BUF zero-copy resize/convert)')
