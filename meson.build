@@ -14,6 +14,7 @@ gst_video_dep = dependency('gstreamer-video-1.0', version : '>= 1.24')
 gst_analytics_dep = dependency('gstreamer-analytics-1.0', version : '>= 1.24',
   required : false)
 gst_allocators_dep = dependency('gstreamer-allocators-1.0', version : '>= 1.24')
+gio_dep = dependency('gio-2.0')
 
 cc = meson.get_compiler('c')
 
@@ -30,4 +31,6 @@ plugins_install_dir = join_paths(
 
 subdir('src')
 
+if get_option('tests')
+  subdir('tests')
 endif

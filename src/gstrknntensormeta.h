@@ -33,6 +33,13 @@ typedef struct {
  * tensors from the RKNN runtime — downstream elements interpret
  * them based on the model type (YOLO, SSD, classification, etc.).
  *
+ * This is intentionally a separate type from GStreamer 1.28's GstTensorMeta.
+ * RKNN model zoo models have post-processing layers (DFL decode, grid
+ * reconstruction) stripped from the graph because the NPU can't run them
+ * efficiently. The resulting tensors are pre-decode feature maps — not the
+ * single decoded tensor that standard consumers like yolov8tensordec expect.
+ * A distinct GType prevents silent misconnection with those elements.
+ *
  * The tensor data is owned by this meta and freed when the buffer
  * is released. Each tensor is a contiguous block of memory.
  */

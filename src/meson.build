@@ -23,9 +23,14 @@ plugin_c_args = [
 ]
 
 if gst_analytics_dep.found()
-  plugin_deps += gst_analytics_dep
+  plugin_deps += [gst_analytics_dep, gio_dep]
   plugin_c_args += '-DHAVE_GST_ANALYTICS'
-  plugin_sources += ['gstrknnobjectdetector.c', 'yolo_postprocess.c', 'gstrknnclassifier.c']
+  plugin_sources += [
+    'rknn_labels.c',
+    'gstrknnyolov8tensordec.c',
+    'gstrknnyolov5tensordec.c',
+    'gstrknnclassifiertensordec.c',
+  ]
 endif
 
 if rga_dep.found()

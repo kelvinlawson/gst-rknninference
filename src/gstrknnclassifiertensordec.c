@@ -1,16 +1,22 @@
-/* GStreamer RKNN Classifier Element
+/* RKNN Classifier Tensor Decoder
  *
  * Reads GstRknnTensorMeta (attached by rknninference), finds
  * the top-K predictions from a 1D class probability tensor, and
  * outputs GstAnalyticsClsMtd for downstream consumers.
+ *
+ * Modelled on GStreamer 1.28's classifiertensordecoder. Differences:
+ * - Reads GstRknnTensorMeta instead of GstTensorMeta
+ * - Outputs top-K results (upstream only does top-1)
+ * - Auto-detects whether softmax is needed (upstream uses caps negotiation)
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 
 #ifdef HAVE_GST_ANALYTICS
 
-#include "gstrknnclassifier.h"
+#include "gstrknnclassifiertensordec.h"
 #include "gstrknntensormeta.h"
+#include "rknn_labels.h"
 
 #include <gst/analytics/analytics.h>
 #include <gst/analytics/gstanalyticsclassificationmtd.h>
@@ -18,15 +24,17 @@
 #include <math.h>
 #include <string.h>
 
-GST_DEBUG_CATEGORY_STATIC (gst_rknn_cls_debug);
-#define GST_CAT_DEFAULT gst_rknn_cls_debug
+GST_DEBUG_CATEGORY_STATIC (gst_rknn_cls_dec_debug);
+#define GST_CAT_DEFAULT gst_rknn_cls_dec_debug
 
 enum {
   PROP_0,
-  PROP_LABELS,
+  PROP_CLS_CONFIDENCE_THRESHOLD,
   PROP_TOP_K,
+  PROP_LABELS_FILE,
 };
 
+#define DEFAULT_CLS_CONFIDENCE_THRESHOLD 0.7f
 #define DEFAULT_TOP_K 5
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
@@ -37,23 +45,29 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC, GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("video/x-raw"));
 
-G_DEFINE_TYPE (GstRknnClassifier, gst_rknn_classifier,
+G_DEFINE_TYPE (GstRknnClassifierTensorDec, gst_rknn_classifier_tensor_dec,
     GST_TYPE_BASE_TRANSFORM);
 
 static void
-gst_rknn_classifier_set_property (GObject *object, guint prop_id,
+gst_rknn_classifier_tensor_dec_set_property (GObject *object, guint prop_id,
     const GValue *value, GParamSpec *pspec)
 {
-  GstRknnClassifier *self = GST_RKNN_CLASSIFIER (object);
+  GstRknnClassifierTensorDec *self = GST_RKNN_CLASSIFIER_TENSOR_DEC (object);
 
   switch (prop_id) {
-    case PROP_LABELS:
-      g_free (self->labels_file);
-      self->labels_file = g_value_dup_string (value);
+    case PROP_CLS_CONFIDENCE_THRESHOLD:
+      self->cls_confi_thresh = g_value_get_float (value);
       break;
     case PROP_TOP_K:
       self->top_k = g_value_get_uint (value);
       break;
+    case PROP_LABELS_FILE:
+      g_free (self->label_file);
+      self->label_file = g_value_dup_string (value);
+      g_clear_pointer (&self->labels, g_array_unref);
+      if (self->label_file)
+        self->labels = rknn_labels_load (self->label_file);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -61,17 +75,20 @@ gst_rknn_classifier_set_property (GObject *object, guint prop_id,
 }
 
 static void
-gst_rknn_classifier_get_property (GObject *object, guint prop_id,
+gst_rknn_classifier_tensor_dec_get_property (GObject *object, guint prop_id,
     GValue *value, GParamSpec *pspec)
 {
-  GstRknnClassifier *self = GST_RKNN_CLASSIFIER (object);
+  GstRknnClassifierTensorDec *self = GST_RKNN_CLASSIFIER_TENSOR_DEC (object);
 
   switch (prop_id) {
-    case PROP_LABELS:
-      g_value_set_string (value, self->labels_file);
+    case PROP_CLS_CONFIDENCE_THRESHOLD:
+      g_value_set_float (value, self->cls_confi_thresh);
       break;
     case PROP_TOP_K:
       g_value_set_uint (value, self->top_k);
+      break;
+    case PROP_LABELS_FILE:
+      g_value_set_string (value, self->label_file);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -79,66 +96,11 @@ gst_rknn_classifier_get_property (GObject *object, guint prop_id,
   }
 }
 
-static gboolean
-load_labels (GstRknnClassifier *self)
-{
-  gchar *contents = NULL;
-  GError *err = NULL;
-
-  if (!self->labels_file || self->labels_file[0] == '\0')
-    return FALSE;
-
-  if (!g_file_get_contents (self->labels_file, &contents, NULL, &err)) {
-    GST_WARNING_OBJECT (self, "Cannot load labels from %s: %s",
-        self->labels_file, err->message);
-    g_error_free (err);
-    return FALSE;
-  }
-
-  g_strfreev (self->labels);
-  self->labels = g_strsplit (contents, "\n", -1);
-  g_free (contents);
-
-  /* Count non-empty labels */
-  self->n_labels = 0;
-  for (gchar **p = self->labels; *p; p++) {
-    g_strstrip (*p);
-    if ((*p)[0] != '\0')
-      self->n_labels++;
-  }
-
-  GST_INFO_OBJECT (self, "Loaded %u labels from %s",
-      self->n_labels, self->labels_file);
-  return TRUE;
-}
-
-static gboolean
-gst_rknn_classifier_start (GstBaseTransform *trans)
-{
-  GstRknnClassifier *self = GST_RKNN_CLASSIFIER (trans);
-
-  if (self->labels_file)
-    load_labels (self);
-
-  return TRUE;
-}
-
-static gboolean
-gst_rknn_classifier_stop (GstBaseTransform *trans)
-{
-  GstRknnClassifier *self = GST_RKNN_CLASSIFIER (trans);
-
-  g_strfreev (self->labels);
-  self->labels = NULL;
-  self->n_labels = 0;
-
-  return TRUE;
-}
-
 static GstFlowReturn
-gst_rknn_classifier_transform_ip (GstBaseTransform *trans, GstBuffer *buf)
+gst_rknn_classifier_tensor_dec_transform_ip (GstBaseTransform *trans,
+    GstBuffer *buf)
 {
-  GstRknnClassifier *self = GST_RKNN_CLASSIFIER (trans);
+  GstRknnClassifierTensorDec *self = GST_RKNN_CLASSIFIER_TENSOR_DEC (trans);
   GstRknnTensorMeta *tmeta;
 
   tmeta = gst_buffer_get_rknn_tensor_meta (buf);
@@ -152,7 +114,6 @@ gst_rknn_classifier_transform_ip (GstBaseTransform *trans, GstBuffer *buf)
     return GST_FLOW_OK;
   }
 
-  /* Use the first output tensor as class probabilities */
   const gfloat *probs = (const gfloat *) tmeta->data[0];
   guint n_classes = tmeta->info[0].n_elems;
 
@@ -184,7 +145,9 @@ gst_rknn_classifier_transform_ip (GstBaseTransform *trans, GstBuffer *buf)
     used[best_idx] = TRUE;
   }
 
-  /* Apply softmax to convert logits to probabilities if values are outside [0,1] */
+  /* Auto-detect softmax: if any top score is outside [0,1], the model
+   * outputs raw logits and we need to apply softmax ourselves. RKNN
+   * classification models typically output logits (softmax stripped). */
   gboolean needs_softmax = FALSE;
   for (guint i = 0; i < k; i++) {
     if (top_scores[i] > 1.0f || top_scores[i] < 0.0f) {
@@ -193,9 +156,8 @@ gst_rknn_classifier_transform_ip (GstBaseTransform *trans, GstBuffer *buf)
     }
   }
 
-  gfloat *softmax_probs = NULL;
   if (needs_softmax) {
-    softmax_probs = g_newa (gfloat, n_classes);
+    gfloat *softmax_probs = g_newa (gfloat, n_classes);
     gfloat max_val = probs[0];
     for (guint i = 1; i < n_classes; i++)
       if (probs[i] > max_val)
@@ -209,36 +171,45 @@ gst_rknn_classifier_transform_ip (GstBaseTransform *trans, GstBuffer *buf)
     for (guint i = 0; i < n_classes; i++)
       softmax_probs[i] /= sum;
 
-    /* Re-read top scores from softmax output */
     for (guint i = 0; i < k; i++)
       top_scores[i] = softmax_probs[top_indices[i]];
   }
 
-  /* Build GstAnalyticsClsMtd with top-K results */
-  GQuark *quarks = g_newa (GQuark, k);
+  /* Filter by confidence threshold */
+  guint n_output = 0;
   for (guint i = 0; i < k; i++) {
-    const gchar *label = NULL;
-    if (self->labels && top_indices[i] < self->n_labels)
-      label = self->labels[top_indices[i]];
-
-    if (label && label[0] != '\0') {
-      quarks[i] = g_quark_from_string (label);
-    } else {
-      gchar idx_label[32];
-      g_snprintf (idx_label, sizeof (idx_label), "class_%u", top_indices[i]);
-      quarks[i] = g_quark_from_string (idx_label);
-    }
+    if (top_scores[i] >= self->cls_confi_thresh)
+      n_output++;
+    else
+      break;
   }
 
-  GstAnalyticsRelationMeta *rmeta;
-  rmeta = gst_buffer_add_analytics_relation_meta (buf);
+  if (n_output == 0)
+    return GST_FLOW_OK;
+
+  /* Build GstAnalyticsClsMtd with results */
+  GQuark *quarks = g_newa (GQuark, n_output);
+  for (guint i = 0; i < n_output; i++) {
+    GQuark q = self->labels
+        ? rknn_labels_get (self->labels, top_indices[i]) : 0;
+
+    if (q == 0) {
+      gchar idx_label[32];
+      g_snprintf (idx_label, sizeof (idx_label), "class_%u", top_indices[i]);
+      q = g_quark_from_string (idx_label);
+    }
+
+    quarks[i] = q;
+  }
+
+  GstAnalyticsRelationMeta *rmeta =
+      gst_buffer_add_analytics_relation_meta (buf);
 
   GstAnalyticsClsMtd cls_mtd;
-  gst_analytics_relation_meta_add_cls_mtd (rmeta, k,
+  gst_analytics_relation_meta_add_cls_mtd (rmeta, n_output,
       top_scores, quarks, &cls_mtd);
 
-  /* Log results */
-  for (guint i = 0; i < k; i++) {
+  for (guint i = 0; i < n_output; i++) {
     GST_DEBUG_OBJECT (self, "  [%u] %s  %.4f",
         i, g_quark_to_string (quarks[i]), top_scores[i]);
   }
@@ -247,34 +218,41 @@ gst_rknn_classifier_transform_ip (GstBaseTransform *trans, GstBuffer *buf)
 }
 
 static void
-gst_rknn_classifier_finalize (GObject *object)
+gst_rknn_classifier_tensor_dec_finalize (GObject *object)
 {
-  GstRknnClassifier *self = GST_RKNN_CLASSIFIER (object);
+  GstRknnClassifierTensorDec *self =
+      GST_RKNN_CLASSIFIER_TENSOR_DEC (object);
 
-  g_free (self->labels_file);
-  g_strfreev (self->labels);
+  g_free (self->label_file);
+  g_clear_pointer (&self->labels, g_array_unref);
 
-  G_OBJECT_CLASS (gst_rknn_classifier_parent_class)->finalize (object);
+  G_OBJECT_CLASS (
+      gst_rknn_classifier_tensor_dec_parent_class)->finalize (object);
 }
 
 static void
-gst_rknn_classifier_class_init (GstRknnClassifierClass *klass)
+gst_rknn_classifier_tensor_dec_class_init (
+    GstRknnClassifierTensorDecClass *klass)
 {
   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
   GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
   GstBaseTransformClass *bt_class = GST_BASE_TRANSFORM_CLASS (klass);
 
-  GST_DEBUG_CATEGORY_INIT (gst_rknn_cls_debug, "rknnclassifier", 0,
-      "RKNN classification decoder");
+  GST_DEBUG_CATEGORY_INIT (gst_rknn_cls_dec_debug,
+      "rknnclassifiertensordec", 0,
+      "RKNN classification tensor decoder");
 
-  gobject_class->set_property = gst_rknn_classifier_set_property;
-  gobject_class->get_property = gst_rknn_classifier_get_property;
-  gobject_class->finalize = gst_rknn_classifier_finalize;
+  gobject_class->set_property =
+      gst_rknn_classifier_tensor_dec_set_property;
+  gobject_class->get_property =
+      gst_rknn_classifier_tensor_dec_get_property;
+  gobject_class->finalize = gst_rknn_classifier_tensor_dec_finalize;
 
-  g_object_class_install_property (gobject_class, PROP_LABELS,
-      g_param_spec_string ("labels", "Labels File",
-          "Path to text file with one class label per line",
-          NULL,
+  g_object_class_install_property (gobject_class, PROP_CLS_CONFIDENCE_THRESHOLD,
+      g_param_spec_float ("class-confidence-threshold",
+          "Class Confidence Threshold",
+          "Minimum confidence to include a class in the output",
+          0.0f, 1.0f, DEFAULT_CLS_CONFIDENCE_THRESHOLD,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   g_object_class_install_property (gobject_class, PROP_TOP_K,
@@ -283,32 +261,34 @@ gst_rknn_classifier_class_init (GstRknnClassifierClass *klass)
           1, 100, DEFAULT_TOP_K,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_LABELS_FILE,
+      g_param_spec_string ("labels-file", "Labels File",
+          "Path to text file with one class label per line",
+          NULL,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gst_element_class_set_static_metadata (element_class,
-      "RKNN Classifier",
+      "RKNN Classifier Tensor Decoder",
       "Filter/Analyzer/Video",
       "Decodes RKNN inference tensors into classification metadata",
-      "Kelvin Lawson <info@lisden.com>");
+      "Kelvin Lawson <klawson@lisden.com>");
 
   gst_element_class_add_static_pad_template (element_class, &sink_template);
   gst_element_class_add_static_pad_template (element_class, &src_template);
 
-  bt_class->start = gst_rknn_classifier_start;
-  bt_class->stop = gst_rknn_classifier_stop;
-  bt_class->transform_ip = gst_rknn_classifier_transform_ip;
-
-  bt_class->passthrough_on_same_caps = TRUE;
+  bt_class->transform_ip = gst_rknn_classifier_tensor_dec_transform_ip;
 }
 
 static void
-gst_rknn_classifier_init (GstRknnClassifier *self)
+gst_rknn_classifier_tensor_dec_init (GstRknnClassifierTensorDec *self)
 {
-  self->labels_file = NULL;
-  self->labels = NULL;
-  self->n_labels = 0;
+  self->cls_confi_thresh = DEFAULT_CLS_CONFIDENCE_THRESHOLD;
   self->top_k = DEFAULT_TOP_K;
+  self->label_file = NULL;
+  self->labels = NULL;
 
   gst_base_transform_set_in_place (GST_BASE_TRANSFORM (self), TRUE);
-  gst_base_transform_set_passthrough (GST_BASE_TRANSFORM (self), TRUE);
+  gst_base_transform_set_passthrough (GST_BASE_TRANSFORM (self), FALSE);
 }
 
 #endif /* HAVE_GST_ANALYTICS */
