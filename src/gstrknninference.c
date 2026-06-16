@@ -274,8 +274,9 @@ resize_bilinear_rgb (const guint8 *src, guint src_w, guint src_h,
 
 #ifdef HAVE_RGA
 /* Allocate intermediate DMA-BUF for two-pass RGA resize.
- * Intermediate size is 2× the model input, keeping both passes
- * well within RGA's 8× downscale limit. */
+ * Both passes must stay within RGA3's 8× downscale limit:
+ *   Pass 1 (src → mid): mid >= ceil(src / 8)
+ *   Pass 2 (mid → dst): mid <= dst × 8 (always true by construction) */
 static gboolean
 ensure_intermediate_buffer (GstRknnInference *self,
     guint src_w, guint src_h)
@@ -286,10 +287,15 @@ ensure_intermediate_buffer (GstRknnInference *self,
   if (self->intermediate_mem)
     return TRUE;
 
-  mid_w = self->model_width * 2;
-  mid_h = self->model_height * 2;
+  /* Start with 2× model dimensions (good for moderate ratios like 1080p),
+   * but raise to ceil(src/8) when the source is large enough that pass 1
+   * would otherwise exceed the hardware limit (e.g. 4K → 224). */
+  guint min_for_pass1_w = (src_w + 7) / 8;
+  guint min_for_pass1_h = (src_h + 7) / 8;
 
-  /* Ensure intermediate is smaller than source */
+  mid_w = MAX (self->model_width * 2, min_for_pass1_w);
+  mid_h = MAX (self->model_height * 2, min_for_pass1_h);
+
   if (mid_w > src_w) mid_w = src_w;
   if (mid_h > src_h) mid_h = src_h;
 

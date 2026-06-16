@@ -97,8 +97,8 @@ rga_resize_from_virt (void *src_virt,
 gboolean
 rga_needs_two_pass (guint src_w, guint src_h, guint dst_w, guint dst_h)
 {
-  /* RGA3 supports up to 8× downscale for YUV, 16× for RGB.
-   * Use the conservative 8× limit since we often start with YUV. */
+  /* RGA3 supports up to 8× downscale regardless of pixel format.
+   * (The 16× capability belongs to RGA2-Enhance only.) */
   gfloat ratio_w = (gfloat) src_w / (gfloat) dst_w;
   gfloat ratio_h = (gfloat) src_h / (gfloat) dst_h;
   return (ratio_w > 8.0f || ratio_h > 8.0f);
