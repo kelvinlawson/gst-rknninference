@@ -574,6 +574,11 @@ gst_rknn_inference_transform_ip (GstBaseTransform *trans,
   if (!ret) {
     GST_WARNING_OBJECT (self, "Inference failed on frame %"
         G_GUINT64_FORMAT, self->frame_counter);
+    /* rknn_outputs_get can fail after partially allocating outputs[i].buf.
+     * Always call release on the failure path: librknnrt skips NULL entries,
+     * so it is safe when nothing was allocated, and recovers the leak when
+     * something was. */
+    rknn_outputs_release (self->rknn->ctx, n_outputs, outputs);
     g_free (outputs);
     return GST_FLOW_OK;
   }
