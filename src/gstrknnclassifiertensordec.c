@@ -39,11 +39,19 @@ enum {
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw"));
+    /* DMA-BUF (incl. modern DMA_DRM) preferred - this element only attaches a
+     * classification label and passes the frame through (no caps parsing needed),
+     * so advertising DMABuf lets the decoder's dmabuf pass straight to the sink,
+     * zero-copy. System memory fallback. */
+    GST_STATIC_CAPS ("video/x-raw(memory:DMABuf); video/x-raw"));
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw"));
+    /* DMA-BUF (incl. modern DMA_DRM) preferred - this element only attaches a
+     * classification label and passes the frame through (no caps parsing needed),
+     * so advertising DMABuf lets the decoder's dmabuf pass straight to the sink,
+     * zero-copy. System memory fallback. */
+    GST_STATIC_CAPS ("video/x-raw(memory:DMABuf); video/x-raw"));
 
 G_DEFINE_TYPE (GstRknnClassifierTensorDec, gst_rknn_classifier_tensor_dec,
     GST_TYPE_BASE_TRANSFORM);

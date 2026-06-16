@@ -21,6 +21,9 @@
 
 #include <gst/analytics/analytics.h>
 #include <gst/analytics/gstanalyticsobjectdetectionmtd.h>
+#if GST_CHECK_VERSION (1, 24, 0)
+#include <gst/video/video-info-dma.h>   /* DMA_DRM caps parsing (header is 1.24+) */
+#endif
 
 #include <math.h>
 #include <string.h>
@@ -55,11 +58,15 @@ static const gint strides[NUM_SCALES] = { 8, 16, 32 };
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw"));
+    /* DMA-BUF (incl. modern DMA_DRM) preferred - pass the decoder's dmabuf
+     * straight through to the sink, zero-copy; system memory fallback. */
+    GST_STATIC_CAPS ("video/x-raw(memory:DMABuf); video/x-raw"));
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw"));
+    /* DMA-BUF (incl. modern DMA_DRM) preferred - pass the decoder's dmabuf
+     * straight through to the sink, zero-copy; system memory fallback. */
+    GST_STATIC_CAPS ("video/x-raw(memory:DMABuf); video/x-raw"));
 
 G_DEFINE_TYPE (GstRknnYolov5TensorDec, gst_rknn_yolov5_tensor_dec,
     GST_TYPE_BASE_TRANSFORM);
@@ -287,6 +294,19 @@ gst_rknn_yolov5_tensor_dec_set_caps (GstBaseTransform *trans,
 {
   GstRknnYolov5TensorDec *self = GST_RKNN_YOLOV5_TENSOR_DEC (trans);
 
+  /* This element passes the video buffer through unchanged and only needs the
+   * frame dimensions (to scale normalised bboxes to pixels). Modern DMA_DRM caps
+   * can't be read by gst_video_info_from_caps(), so resolve them first. */
+#if GST_CHECK_VERSION (1, 24, 0)
+  if (gst_video_is_dma_drm_caps (incaps)) {
+    GstVideoInfoDmaDrm drm_info;
+    if (!gst_video_info_dma_drm_from_caps (&drm_info, incaps) ||
+        !gst_video_info_dma_drm_to_video_info (&drm_info, &self->video_info)) {
+      GST_ERROR_OBJECT (self, "Failed to parse DMA_DRM input caps");
+      return FALSE;
+    }
+  } else
+#endif
   if (!gst_video_info_from_caps (&self->video_info, incaps)) {
     GST_ERROR_OBJECT (self, "Failed to parse input caps");
     return FALSE;

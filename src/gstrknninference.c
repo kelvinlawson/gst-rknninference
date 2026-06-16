@@ -10,6 +10,9 @@
 #include "gstrknninference.h"
 #include "gstrknntensormeta.h"
 #include <gst/video/gstvideometa.h>
+#if GST_CHECK_VERSION (1, 24, 0)
+#include <gst/video/video-info-dma.h>   /* DMA_DRM caps parsing (header is 1.24+) */
+#endif
 #include <string.h>
 
 #ifdef HAVE_RGA
@@ -30,22 +33,28 @@ enum {
 #define DEFAULT_NPU_CORE            0
 #define DEFAULT_INFERENCE_INTERVAL  1
 
-/* Accept any raw video format — the element handles conversion
- * to the model's expected input format internally. */
+/* DMA-BUF (incl. the modern DMA_DRM dialect) preferred for zero-copy passthrough;
+ * pixel-format names cover legacy DMA-BUF and system-memory sources. */
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE (
     "sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw, "
+    GST_STATIC_CAPS (
+        "video/x-raw(memory:DMABuf), "
+        "format = (string) { DMA_DRM, RGB, BGR, NV12, NV21 }, "
+        "width = (int) [ 1, 8192 ], height = (int) [ 1, 8192 ]; "
+        "video/x-raw, "
         "format = (string) { RGB, BGR, NV12, NV21 }, "
-        "width = (int) [ 1, 8192 ], "
-        "height = (int) [ 1, 8192 ]")
+        "width = (int) [ 1, 8192 ], height = (int) [ 1, 8192 ]")
 );
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE (
     "src", GST_PAD_SRC, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw, "
+    GST_STATIC_CAPS (
+        "video/x-raw(memory:DMABuf), "
+        "format = (string) { DMA_DRM, RGB, BGR, NV12, NV21 }, "
+        "width = (int) [ 1, 8192 ], height = (int) [ 1, 8192 ]; "
+        "video/x-raw, "
         "format = (string) { RGB, BGR, NV12, NV21 }, "
-        "width = (int) [ 1, 8192 ], "
-        "height = (int) [ 1, 8192 ]")
+        "width = (int) [ 1, 8192 ], height = (int) [ 1, 8192 ]")
 );
 
 #define gst_rknn_inference_parent_class parent_class
@@ -105,6 +114,21 @@ gst_rknn_inference_set_caps (GstBaseTransform *trans,
 {
   GstRknnInference *self = GST_RKNN_INFERENCE (trans);
 
+  /* gst_video_info_from_caps() cannot parse modern DMA_DRM caps (format is the
+   * "DMA_DRM" sentinel; the real fourcc/modifier live in drm-format). Resolve
+   * those to a normal GstVideoInfo so the RGA path below still reads a real
+   * pixel format/dimensions. The buffer passes through unchanged either way -
+   * we only inspect it for the NPU resize. */
+#if GST_CHECK_VERSION (1, 24, 0)
+  if (gst_video_is_dma_drm_caps (incaps)) {
+    GstVideoInfoDmaDrm drm_info;
+    if (!gst_video_info_dma_drm_from_caps (&drm_info, incaps) ||
+        !gst_video_info_dma_drm_to_video_info (&drm_info, &self->video_info)) {
+      GST_ERROR_OBJECT (self, "Failed to parse DMA_DRM input caps");
+      return FALSE;
+    }
+  } else
+#endif
   if (!gst_video_info_from_caps (&self->video_info, incaps)) {
     GST_ERROR_OBJECT (self, "Failed to parse input caps");
     return FALSE;
