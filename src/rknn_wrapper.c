@@ -3,9 +3,20 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 
+/* _GNU_SOURCE before any includes - needed for O_CLOEXEC under -std=c11
+ * (which otherwise restricts <fcntl.h> to POSIX.1-2001 visibility). */
+#define _GNU_SOURCE 1
+
 #include "rknn_wrapper.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/dma-heap.h>
 
 RknnWrapper *
 rknn_wrapper_new (void)
@@ -169,28 +180,82 @@ rknn_wrapper_unload (RknnWrapper *self)
   self->initialised = FALSE;
 }
 
+/* Allocate from /dev/dma_heap/cma (CMA is below 4 GB on RK3588) and hand
+ * the fd to rknn_create_mem_from_fd, so the buffer is reachable by RGA2's
+ * 32-bit IOVA. */
 rknn_tensor_mem *
 rknn_wrapper_alloc_mem (RknnWrapper *self, guint32 size)
 {
   rknn_tensor_mem *mem;
+  struct dma_heap_allocation_data alloc = { 0 };
+  int heap_fd, buf_fd;
+  void *virt;
 
   g_return_val_if_fail (self != NULL && self->initialised, NULL);
 
-  mem = rknn_create_mem (self->ctx, size);
-  if (!mem) {
-    g_warning ("rknn_wrapper: rknn_create_mem(%u) failed", size);
+  heap_fd = open ("/dev/dma_heap/cma", O_RDWR | O_CLOEXEC);
+  if (heap_fd < 0) {
+    g_warning ("rknn_wrapper: cannot open /dev/dma_heap/cma: %s",
+        g_strerror (errno));
     return NULL;
   }
 
+  alloc.len = size;
+  alloc.fd_flags = O_RDWR | O_CLOEXEC;
+  if (ioctl (heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc) < 0) {
+    g_warning ("rknn_wrapper: DMA_HEAP_IOCTL_ALLOC(%u) failed: %s",
+        size, g_strerror (errno));
+    close (heap_fd);
+    return NULL;
+  }
+  buf_fd = (int) alloc.fd;
+  close (heap_fd);   /* only needed for the alloc ioctl */
+
+  virt = mmap (NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, buf_fd, 0);
+  if (virt == MAP_FAILED) {
+    g_warning ("rknn_wrapper: mmap dma-buf fd=%d failed: %s",
+        buf_fd, g_strerror (errno));
+    close (buf_fd);
+    return NULL;
+  }
+
+  mem = rknn_create_mem_from_fd (self->ctx, buf_fd, virt, size, 0);
+  if (!mem) {
+    g_warning ("rknn_wrapper: rknn_create_mem_from_fd(fd=%d, size=%u) failed",
+        buf_fd, size);
+    munmap (virt, size);
+    close (buf_fd);
+    return NULL;
+  }
+
+  /* mem->fd / mem->virt_addr / mem->size now mirror our allocation.
+   * destroy_mem() pulls them back from `mem` to clean up. */
   return mem;
 }
 
 void
 rknn_wrapper_destroy_mem (RknnWrapper *self, rknn_tensor_mem *mem)
 {
+  int fd;
+  void *virt;
+  uint32_t size;
+
   if (!self || !self->initialised || !mem)
     return;
+
+  /* Capture BEFORE rknn_destroy_mem - after that call `mem` is freed. */
+  fd = mem->fd;
+  virt = mem->virt_addr;
+  size = mem->size;
+
   rknn_destroy_mem (self->ctx, mem);
+
+  /* Drop our references. rknn_destroy_mem already dropped its dma-buf ref;
+   * the dma-buf is fully freed when our close() drops the last one. */
+  if (virt && virt != MAP_FAILED)
+    munmap (virt, size);
+  if (fd >= 0)
+    close (fd);
 }
 
 gboolean
