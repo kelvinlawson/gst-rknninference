@@ -180,9 +180,38 @@ rknn_wrapper_unload (RknnWrapper *self)
   self->initialised = FALSE;
 }
 
-/* Allocate from /dev/dma_heap/cma (CMA is below 4 GB on RK3588) and hand
- * the fd to rknn_create_mem_from_fd, so the buffer is reachable by RGA2's
- * 32-bit IOVA. */
+/* Allocate from a dma_heap that's reachable by RGA2's 32-bit IOVA and hand
+ * the fd to rknn_create_mem_from_fd. Different Rockchip kernel forks expose
+ * different heap names for the same low-4 GB CMA region.
+ *
+ * Logged once per RknnWrapper init so the operator can see which heap we
+ * landed on; if a deploy hits the system fallback that's a signal to file
+ * a kernel-DTS request to expose a proper low-4 GB heap. */
+static const char *const RKNN_DMA_HEAP_CANDIDATES[] = {
+  "/dev/dma_heap/cma",
+  "/dev/dma_heap/reserved",
+  "/dev/dma_heap/system-dma32",
+  "/dev/dma_heap/system",
+  NULL
+};
+
+static int
+rknn_wrapper_open_dma_heap (void)
+{
+  for (int i = 0; RKNN_DMA_HEAP_CANDIDATES[i]; i++) {
+    int fd = open (RKNN_DMA_HEAP_CANDIDATES[i], O_RDWR | O_CLOEXEC);
+    if (fd >= 0) {
+      static const char *last_logged = NULL;
+      if (last_logged != RKNN_DMA_HEAP_CANDIDATES[i]) {
+        g_message ("rknn_wrapper: using %s", RKNN_DMA_HEAP_CANDIDATES[i]);
+        last_logged = RKNN_DMA_HEAP_CANDIDATES[i];
+      }
+      return fd;
+    }
+  }
+  return -1;
+}
+
 rknn_tensor_mem *
 rknn_wrapper_alloc_mem (RknnWrapper *self, guint32 size)
 {
@@ -193,9 +222,10 @@ rknn_wrapper_alloc_mem (RknnWrapper *self, guint32 size)
 
   g_return_val_if_fail (self != NULL && self->initialised, NULL);
 
-  heap_fd = open ("/dev/dma_heap/cma", O_RDWR | O_CLOEXEC);
+  heap_fd = rknn_wrapper_open_dma_heap ();
   if (heap_fd < 0) {
-    g_warning ("rknn_wrapper: cannot open /dev/dma_heap/cma: %s",
+    g_warning ("rknn_wrapper: no usable /dev/dma_heap/* "
+        "(tried cma, reserved, system-dma32, system): %s",
         g_strerror (errno));
     return NULL;
   }
