@@ -29,6 +29,7 @@ if gst_analytics_dep.found()
     'rknn_labels.c',
     'gstrknnyolov8tensordec.c',
     'gstrknnyolov5tensordec.c',
+    'gstrknnpicodettensordec.c',
     'gstrknnclassifiertensordec.c',
   ]
 endif

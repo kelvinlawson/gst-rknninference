@@ -145,6 +145,21 @@ gst_rknn_inference_set_caps (GstBaseTransform *trans,
   return TRUE;
 }
 
+static const gchar *
+rknn_tensor_format_name (rknn_tensor_format fmt)
+{
+  switch (fmt) {
+    case RKNN_TENSOR_NCHW:
+      return "NCHW";
+    case RKNN_TENSOR_NHWC:
+      return "NHWC";
+    case RKNN_TENSOR_NC1HWC2:
+      return "NC1HWC2";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 static gboolean
 gst_rknn_inference_start (GstBaseTransform *trans)
 {
@@ -171,15 +186,18 @@ gst_rknn_inference_start (GstBaseTransform *trans)
 
   for (guint i = 0; i < self->rknn->n_inputs; i++) {
     rknn_tensor_attr *a = &self->rknn->input_attrs[i];
-    GST_INFO_OBJECT (self, "  input[%u]: %ux%ux%ux%u fmt=%d type=%d",
+    GST_INFO_OBJECT (self, "  input[%u]: %ux%ux%ux%u (%u) fmt=%s type=%d",
         i, a->dims[0], a->dims[1], a->dims[2], a->dims[3],
-        a->fmt, a->type);
+        a->n_dims, rknn_tensor_format_name (a->fmt), a->type);
   }
 
   for (guint i = 0; i < self->rknn->n_outputs; i++) {
     rknn_tensor_attr *a = &self->rknn->output_attrs[i];
-    GST_INFO_OBJECT (self, "  output[%u]: %ux%ux%ux%u size=%u",
-        i, a->dims[0], a->dims[1], a->dims[2], a->dims[3], a->size);
+    GST_INFO_OBJECT (self,
+        "  output[%u]: %ux%ux%ux%u (%u) fmt=%s type=%d size=%u",
+        i, a->dims[0], a->dims[1], a->dims[2], a->dims[3],
+        a->n_dims, rknn_tensor_format_name (a->fmt),
+        a->type, a->size);
   }
 
   /* Extract model input dimensions from attributes.
@@ -200,14 +218,16 @@ gst_rknn_inference_start (GstBaseTransform *trans)
     gsize buf_size = self->model_width * self->model_height *
         self->model_channels;
     self->resize_buf = g_malloc (buf_size);
+    self->model_format = in->fmt;
+    if (self->model_format == RKNN_TENSOR_NCHW)
+      self->input_buf = g_malloc (buf_size);
 
     GST_INFO_OBJECT (self, "Model input: %ux%ux%u (%s)",
         self->model_width, self->model_height, self->model_channels,
         in->fmt == RKNN_TENSOR_NHWC ? "NHWC" : "NCHW");
 
-#ifdef HAVE_RGA
     /* Allocate RKNN DMA-BUF memory for zero-copy input.
-     * RGA writes the resized frame here, RKNN reads it directly. */
+     * This is also used by the direct-copy path when RGA is skipped. */
     self->input_mem = rknn_wrapper_alloc_mem (self->rknn, buf_size);
     if (self->input_mem) {
       if (rknn_wrapper_bind_input_mem (self->rknn, self->input_mem)) {
@@ -225,7 +245,6 @@ gst_rknn_inference_start (GstBaseTransform *trans)
       GST_WARNING_OBJECT (self,
           "Failed to allocate RKNN memory, falling back to CPU path");
     }
-#endif
   }
 
   return TRUE;
@@ -253,6 +272,8 @@ gst_rknn_inference_stop (GstBaseTransform *trans)
   }
   g_free (self->resize_buf);
   self->resize_buf = NULL;
+  g_free (self->input_buf);
+  self->input_buf = NULL;
 
   return TRUE;
 }
@@ -427,6 +448,82 @@ try_dmabuf_zerocopy (GstRknnInference *self, GstBuffer *buf)
 #endif
 }
 
+/* The frame size and format already matches the model input.
+ * Copy directly into the RKNN-bound DMA buffer and skip RGA entirely. */
+static gboolean
+copy_frame_to_input_mem (GstRknnInference *self,
+    GstVideoFrame *frame)
+{
+  GstVideoFormat fmt;
+  guint width;
+  guint height;
+  guint row_bytes;
+  guint stride;
+  guint8 *src;
+  guint8 *dst;
+
+  if (self->model_format != RKNN_TENSOR_NHWC)
+    return FALSE;
+
+  if (!self->zerocopy_bound ||
+      !self->input_mem ||
+      !self->input_mem->virt_addr)
+    return FALSE;
+
+  if (self->model_format != RKNN_TENSOR_NHWC)
+    return FALSE;
+
+  fmt = GST_VIDEO_INFO_FORMAT (&self->video_info);
+  width = GST_VIDEO_FRAME_WIDTH (frame);
+  height = GST_VIDEO_FRAME_HEIGHT (frame);
+
+  if (fmt != GST_VIDEO_FORMAT_RGB ||
+      width != self->model_width ||
+      height != self->model_height ||
+      self->model_channels != 3)
+    return FALSE;
+
+  row_bytes = width * 3;
+  stride = GST_VIDEO_FRAME_PLANE_STRIDE (frame, 0);
+  src = GST_VIDEO_FRAME_PLANE_DATA (frame, 0);
+  dst = (guint8 *) self->input_mem->virt_addr;
+
+  if (stride == row_bytes) {
+    memcpy (dst, src, (gsize) row_bytes * height);
+  } else {
+    for (guint y = 0; y < height; y++) {
+      memcpy (dst + (gsize) y * row_bytes,
+          src + (gsize) y * stride,
+          row_bytes);
+    }
+  }
+
+  GST_LOG_OBJECT (self, "Direct frame copy: %ux%u, stride=%u",
+      width, height, stride);
+
+  return TRUE;
+}
+
+/* Try DMA-BUF -> CPU map/copy -> RKNN-bound DMA buffer. */
+static gboolean
+try_dmabuf_memcopy (GstRknnInference *self, GstBuffer *buf)
+{
+  GstVideoFrame frame;
+  gboolean copied;
+
+  if (gst_buffer_n_memory (buf) < 1 ||
+      !gst_is_dmabuf_memory (gst_buffer_peek_memory (buf, 0)))
+    return FALSE;
+
+  if (!gst_video_frame_map (&frame, &self->video_info, buf, GST_MAP_READ))
+    return FALSE;
+
+  copied = copy_frame_to_input_mem (self, &frame);
+
+  gst_video_frame_unmap (&frame);
+  return copied;
+}
+
 static GstFlowReturn
 gst_rknn_inference_transform_ip (GstBaseTransform *trans,
     GstBuffer *buf)
@@ -437,7 +534,9 @@ gst_rknn_inference_transform_ip (GstBaseTransform *trans,
   gpointer *tensor_data = NULL;
   guint n_outputs;
   gboolean ret;
-  gboolean used_zerocopy = FALSE;
+  gboolean used_dmabuf = FALSE;
+  gboolean used_rga = FALSE;
+  gboolean used_cpu = FALSE;
 
   if (!self->rknn)
     return GST_FLOW_OK;
@@ -462,10 +561,18 @@ gst_rknn_inference_transform_ip (GstBaseTransform *trans,
     outputs[i].is_prealloc = FALSE;
   }
 
-  /* Try DMA-BUF + RGA zero-copy path first */
-  used_zerocopy = try_dmabuf_zerocopy (self, buf);
+  /* Try exact-size DMA-BUF -> RKNN input-memory copy first. */
+  if (try_dmabuf_memcopy (self, buf)) {
+    used_dmabuf = TRUE;
+    used_rga = FALSE;
+  }
+  /* Try DMA-BUF -> RGA -> RKNN input memory next. */
+  else if (try_dmabuf_zerocopy (self, buf)) {
+    used_dmabuf = TRUE;
+    used_rga = TRUE;
+  }
 
-  if (used_zerocopy) {
+  if (used_dmabuf || used_rga) {
     ret = rknn_wrapper_run_zerocopy (self->rknn, outputs);
   } else {
     GstVideoFrame frame;
@@ -477,11 +584,19 @@ gst_rknn_inference_transform_ip (GstBaseTransform *trans,
       return GST_FLOW_ERROR;
     }
 
+    /* Try exact-size system-memory RGB -> RKNN input-memory copy. */
+    if (copy_frame_to_input_mem (self, &frame)) {
+      gst_video_frame_unmap (&frame);
+      ret = rknn_wrapper_run_zerocopy (self->rknn, outputs);
+      goto inference_done;
+    }
+
 #ifdef HAVE_RGA
     /* RGA-accelerated fallback: use RGA hardware to resize from the
      * system-memory frame into the RKNN DMA-BUF, then zero-copy to NPU.
      * Much faster than CPU resize (~20+ FPS vs ~10 FPS on 1080p). */
-    if (self->zerocopy_bound && self->input_mem) {
+    if (self->model_format == RKNN_TENSOR_NHWC &&
+      self->zerocopy_bound && self->input_mem) {
       guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
       guint vid_w = GST_VIDEO_FRAME_WIDTH (&frame);
       guint vid_h = GST_VIDEO_FRAME_HEIGHT (&frame);
@@ -517,6 +632,7 @@ gst_rknn_inference_transform_ip (GstBaseTransform *trans,
         gst_video_frame_unmap (&frame);
         GST_LOG_OBJECT (self, "RGA fallback resize %ux%u → %ux%u",
             vid_w, vid_h, self->model_width, self->model_height);
+        used_rga = TRUE;
         ret = rknn_wrapper_run_zerocopy (self->rknn, outputs);
         goto inference_done;
       }
@@ -555,16 +671,30 @@ gst_rknn_inference_transform_ip (GstBaseTransform *trans,
             self->resize_buf, self->model_width, self->model_height);
       }
 
+      if (self->model_format == RKNN_TENSOR_NCHW) {
+        guint plane_size = self->model_width * self->model_height;
+        for (guint y = 0; y < self->model_height; y++) {
+          for (guint x = 0; x < self->model_width; x++) {
+            guint pixel = y * self->model_width + x;
+            for (guint c = 0; c < self->model_channels; c++)
+              self->input_buf[c * plane_size + pixel] =
+                  self->resize_buf[pixel * self->model_channels + c];
+          }
+        }
+      }
+
+      used_cpu = TRUE;
       gst_video_frame_unmap (&frame);
 
       memset (inputs, 0, sizeof (inputs));
       inputs[0].index = 0;
-      inputs[0].buf = self->resize_buf;
+        inputs[0].buf = self->model_format == RKNN_TENSOR_NCHW
+          ? self->input_buf : self->resize_buf;
       inputs[0].size = self->model_width * self->model_height *
           self->model_channels;
       inputs[0].pass_through = FALSE;
       inputs[0].type = RKNN_TENSOR_UINT8;
-      inputs[0].fmt = RKNN_TENSOR_NHWC;
+      inputs[0].fmt = self->model_format;
 
       ret = rknn_wrapper_run (self->rknn, inputs, outputs);
     }
@@ -583,8 +713,11 @@ gst_rknn_inference_transform_ip (GstBaseTransform *trans,
     return GST_FLOW_OK;
   }
 
-  GST_DEBUG_OBJECT (self, "Inference done (%s), frame %" G_GUINT64_FORMAT
-      ", %u outputs", used_zerocopy ? "zero-copy" : "CPU",
+  GST_DEBUG_OBJECT (self, "Inference done (%s + %s), frame %" G_GUINT64_FORMAT
+      ", %u outputs",
+      used_dmabuf ? "DMA_BUF" : "SYS_MEM",
+      used_rga ? "RGA" :
+      used_cpu ? "CPU resize" : "memcpy",
       self->frame_counter, n_outputs);
 
   /* Copy output tensors into GstRknnTensorMeta.
@@ -708,4 +841,6 @@ gst_rknn_inference_init (GstRknnInference *self)
   self->frame_counter = 0;
   self->input_mem = NULL;
   self->zerocopy_bound = FALSE;
+  self->model_format = RKNN_TENSOR_NHWC;
+  self->input_buf = NULL;
 }

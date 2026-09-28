@@ -39,6 +39,8 @@ struct _GstRknnInference {
   guint          model_width;
   guint          model_height;
   guint          model_channels;
+  rknn_tensor_format model_format;
+  guint8        *input_buf;
 
   /* DMA-BUF zero-copy path (Phase 4) */
   rknn_tensor_mem *input_mem;     /* RKNN-allocated DMA-BUF for resized input */

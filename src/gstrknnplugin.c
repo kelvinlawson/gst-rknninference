@@ -8,6 +8,7 @@
 #ifdef HAVE_GST_ANALYTICS
 #include "gstrknnyolov8tensordec.h"
 #include "gstrknnyolov5tensordec.h"
+#include "gstrknnpicodettensordec.h"
 #include "gstrknnclassifiertensordec.h"
 #endif
 
@@ -26,6 +27,8 @@ plugin_init (GstPlugin *plugin)
       GST_RANK_NONE, GST_TYPE_RKNN_YOLOV5_TENSOR_DEC);
   ret &= gst_element_register (plugin, "rknnclassifiertensordec",
       GST_RANK_NONE, GST_TYPE_RKNN_CLASSIFIER_TENSOR_DEC);
+  ret &= gst_element_register (plugin, "rknnpicodettensordec",
+      GST_RANK_NONE, GST_TYPE_RKNN_PICODET_TENSOR_DEC);
 #endif
 
   return ret;
@@ -35,7 +38,7 @@ GST_PLUGIN_DEFINE (
     GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
     rknninference,
-    "RKNN neural network inference for Rockchip RK3588 NPU",
+    "RKNN neural network inference for Rockchip RK3588/RK3576 NPU",
     plugin_init,
     "0.2.0",
     "LGPL",

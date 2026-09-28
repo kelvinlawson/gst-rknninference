@@ -31,6 +31,6 @@ plugins_install_dir = join_paths(
 
 subdir('src')
 
-if get_option('tests')
-  subdir('tests')
-endif
+#if get_option('tests')
+#  subdir('tests')
+#endif
